@@ -1,3 +1,23 @@
 *.bk
 __pycache__
 .DS_Store
+
+# Local secrets and runtime environment files.
+.env.local
+.env.*
+*.pem
+*.key
+
+# Model weights and large generated artifacts should stay out of git.
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+*.gguf
+*.bin
+*.onnx
+
+# Local batch outputs.
+outputs/
+new_caption/
+caption_outputs/
