@@ -50,11 +50,12 @@ class GPUWorker:
         self.params = {"use_image_id": False, "max_slice_nums": max_slice_nums}
         print("Worker init done", flush=True)
 
-    def process(self, video_path):
+    def process(self, item):
+        video_path = item["local_video_path"]
         try:
             frames = encode_video(video_path, self.max_num_frames)
         except Exception as e:
-            return {"video": video_path, "error": f"Video encode error: {str(e)}"}
+            return {**item, "error": f"Video encode error: {str(e)}"}
         msgs = [{'role': 'user', 'content': [self.question] + frames}]
         answer = None
         for attempt in range(3):
@@ -63,18 +64,57 @@ class GPUWorker:
                     answer = self.model.chat(image=None, msgs=msgs, tokenizer=self.tokenizer, **self.params)
                 parsed_json = parse_json_answer(answer)
                 if parsed_json is not None:
-                    return {"video": video_path, "answer": parsed_json}
+                    return {**item, "answer": parsed_json}
             except Exception as e:
                 if attempt == 2:
-                    return {"video": video_path, "error": f"Inference error: {str(e)}"}
+                    return {**item, "error": f"Inference error: {str(e)}"}
             finally:
                 self.torch.cuda.empty_cache()
-        return {"video": video_path, "error": "Failed to generate valid JSON after 3 attempts", "raw_answer": answer}
+        return {**item, "error": "Failed to generate valid JSON after 3 attempts", "raw_answer": answer}
+
+def safe_output_stem(value):
+    value = str(value or "").strip()
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+    return safe or "item"
+
+def load_input_items(args):
+    items = []
+    if args.input_list:
+        with open(args.input_list, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                local_path = item.get("local_video_path") or item.get("video") or item.get("path")
+                if not local_path:
+                    raise ValueError(f"Input-list item is missing local_video_path: {item}")
+                item_id = item.get("item_id") or os.path.splitext(os.path.basename(local_path))[0]
+                items.append({
+                    **item,
+                    "item_id": str(item_id),
+                    "local_video_path": str(local_path),
+                })
+    else:
+        videos = sorted(glob.glob(os.path.join(args.input_dir, args.pattern), recursive=True))
+        for video_path in videos:
+            base = os.path.splitext(os.path.basename(video_path))[0]
+            items.append({
+                "schema_version": "dataset_item.v1",
+                "item_id": base,
+                "local_video_path": video_path,
+                "video_key": None,
+            })
+
+    if args.limit_items is not None:
+        items = items[:args.limit_items]
+    return items
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, default="openbmb/MiniCPM-V-4_5")
     parser.add_argument("--input_dir", type=str, default="/mnt/data1/data_collection_OGameData/dynamics_count/2")
+    parser.add_argument("--input_list", type=str, default=None)
     parser.add_argument("--pattern", type=str, default="**/*.mp4")
     parser.add_argument("--question", type=str, default="Describe the video")
     parser.add_argument("--gpu_ids", type=str, default="0,1,2,3,4,5,6,7")
@@ -82,6 +122,7 @@ def main():
     parser.add_argument("--attn_impl", type=str, default="sdpa", choices=["sdpa","flash_attention_2"])
     parser.add_argument("--max_num_frames", type=int, default=70)
     parser.add_argument("--max_slice_nums", type=int, default=2)
+    parser.add_argument("--limit_items", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default="/mnt/data1/data_collection_OGameData/dynamics_count/new_caption")
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -96,21 +137,20 @@ def main():
         video_content_description: Please provide a single, continuous, and fluent textual description of the video content, with around 150 to 200 words. Avoid using any formatting, bullet points, or lists. Use natural language to describe the video in a cohesive paragraph, covering the main scene, actions, environment, characters, and any notable features. Keep the description concise yet comprehensive, ensuring it reflects the overall content of the video.
     """
 
-    videos = sorted(glob.glob(os.path.join(args.input_dir, args.pattern), recursive=True))
+    items = load_input_items(args)
 
     # # 测试用，随机抽取100个视频
     # import random
-    # random.shuffle(videos)
-    # videos = videos[:50]   # 调试用，只处理随机抽取的100个视频
-    # videos.append("/mnt/data1/data_collection_OGameData/games_count/Cyberpunk_2077/0J55aRPrgOM_scene-439_1.mp4")
+    # random.shuffle(items)
+    # items = items[:50]
 
-    if not videos:
+    if not items:
         print("No videos found"); return
 
     # checkpoint-resume: skip already processed videos
     to_process = []
-    for v in videos:
-        base = os.path.splitext(os.path.basename(v))[0]
+    for item in items:
+        base = safe_output_stem(item.get("item_id"))
         json_path = os.path.join(args.output_dir, base + ".json")
         txt_path = os.path.join(args.output_dir, base + ".txt")
         def non_empty(p):
@@ -119,9 +159,9 @@ def main():
             except Exception:
                 return False
         if non_empty(json_path) and non_empty(txt_path):
-            print(f"[SKIP] {v} already processed.")
+            print(f"[SKIP] {item['local_video_path']} already processed.")
             continue
-        to_process.append(v)
+        to_process.append(item)
 
     if not to_process:
         print("All videos already processed; nothing to do.")
@@ -136,9 +176,9 @@ def main():
     workers = [GPUWorker.remote(args.model_path, args.dtype, args.attn_impl, args.max_slice_nums, args.max_num_frames, question) for _ in gpu_ids]
 
     futures = []
-    for i, v in enumerate(to_process):
+    for i, item in enumerate(to_process):
         actor = workers[i % len(workers)]
-        futures.append(actor.process.remote(v))
+        futures.append(actor.process.remote(item))
 
     pending = list(futures)
     total = len(pending)
@@ -150,16 +190,28 @@ def main():
             print(f"Waiting... Progress {done}/{total}", flush=True)
             continue
         item = ray.get(ready[0])
-        base = os.path.splitext(os.path.basename(item['video']))[0]
+        base = safe_output_stem(item.get("item_id"))
         out_path = os.path.join(args.output_dir, base + ".json")
         if "error" in item:
-            print(f"[ERROR] {item['video']}: {item['error']}")
-            data = {"video": item['video'], "error": item['error']}
+            print(f"[ERROR] {item['local_video_path']}: {item['error']}")
+            data = {
+                "item_id": item.get("item_id"),
+                "video": item.get("local_video_path"),
+                "video_key": item.get("video_key"),
+                "error": item["error"],
+            }
             stats["failure"] += 1
-            stats["errors"].append({"video": item['video'], "error": item['error']})
+            stats["errors"].append({"item_id": item.get("item_id"), "video": item.get("local_video_path"), "error": item["error"]})
         else:
-            print(f"[OK] {item['video']}: {item['answer']}")
-            data = {"video": item['video'], "answer": item['answer']}
+            print(f"[OK] {item['local_video_path']}: {item['answer']}")
+            data = {
+                "item_id": item.get("item_id"),
+                "video": item.get("local_video_path"),
+                "video_key": item.get("video_key"),
+                "channel": item.get("channel"),
+                "slice_index": item.get("slice_index"),
+                "answer": item["answer"],
+            }
             stats["success"] += 1
             desc = item['answer'].get("video_content_description")
             if isinstance(desc, str):
