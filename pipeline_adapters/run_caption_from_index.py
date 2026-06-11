@@ -98,6 +98,14 @@ def read_prepared_items(runtime_input: dict[str, Any], work_dir: Path) -> tuple[
     return items, prepared_path
 
 
+def index_run_id(runtime_input: dict[str, Any]) -> str | None:
+    task = runtime_input.get("task") or {}
+    artifacts = task.get("artifacts") or {}
+    index_artifacts = artifacts.get("build_caption_index_v1") or {}
+    value = index_artifacts.get("run_id") or (task.get("batch") or {}).get("run_id") or task.get("task_id")
+    return str(value).strip() if value else None
+
+
 def write_input_list(path: Path, items: list[dict[str, Any]], *, limit_items: int | None) -> list[dict[str, Any]]:
     selected = items[:limit_items] if limit_items is not None else items
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -243,9 +251,11 @@ def main() -> int:
             batch_output_dir=batch_output_dir,
             caption_jsonl_path=caption_jsonl_path,
         )
+        run_id = index_run_id(runtime_input)
         manifest = {
             "schema_version": "caption_manifest.v1",
             "task_id": runtime_input.get("task_id"),
+            "run_id": run_id,
             "prepared_items_path": str(prepared_path),
             "input_list_path": str(input_list_path),
             "total_item_count": len(selected_items),
@@ -259,7 +269,10 @@ def main() -> int:
         write_json(manifest_path, manifest)
         success_path.write_text("", encoding="utf-8")
 
-        output_prefix = ensure_trailing_slash(str(params.get("output_prefix") or "test/output/minicpm_caption_v1/smoke/"))
+        raw_output_prefix = str(params.get("output_prefix") or "test/output/minicpm_caption_v1/smoke/")
+        if run_id:
+            raw_output_prefix = raw_output_prefix.format(run_id=run_id)
+        output_prefix = ensure_trailing_slash(raw_output_prefix)
         output_files = [
             {"local_path": str(caption_jsonl_path), "output_key": f"{output_prefix}captions.jsonl"},
             {"local_path": str(manifest_path), "output_key": f"{output_prefix}_manifest.json"},
