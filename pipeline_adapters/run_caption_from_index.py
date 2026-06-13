@@ -106,6 +106,32 @@ def index_run_id(runtime_input: dict[str, Any]) -> str | None:
     return str(value).strip() if value else None
 
 
+def resolve_gpu_ids(params: dict[str, Any]) -> tuple[str, str]:
+    requested_gpu_ids = str(params.get("gpu_ids") or "auto").strip()
+    requested_cuda_visible = str(params.get("cuda_visible_devices") or "auto").strip()
+    allocated = os.environ.get("BOS_PIPELINE_ALLOCATED_GPUS", "").strip()
+
+    if requested_gpu_ids.lower() == "auto":
+        if not allocated:
+            raise RuntimeError(
+                "gpu_ids=auto requires BOS_PIPELINE_ALLOCATED_GPUS from the GPU worker launcher."
+            )
+        gpu_ids = allocated
+        gpu_mode = "auto"
+    else:
+        gpu_ids = requested_gpu_ids
+        gpu_mode = "explicit"
+
+    if requested_cuda_visible.lower() == "auto":
+        cuda_visible_devices = gpu_ids
+    else:
+        cuda_visible_devices = requested_cuda_visible
+
+    os.environ["BOS_PIPELINE_ALLOCATED_GPUS"] = gpu_ids
+    os.environ["BOS_PIPELINE_ALLOCATED_GPU_COUNT"] = str(len([item for item in gpu_ids.split(",") if item.strip()]))
+    return gpu_ids, gpu_mode if cuda_visible_devices == gpu_ids else f"{gpu_mode}:custom_cuda_visible"
+
+
 def write_input_list(path: Path, items: list[dict[str, Any]], *, limit_items: int | None) -> list[dict[str, Any]]:
     selected = items[:limit_items] if limit_items is not None else items
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -196,7 +222,7 @@ def main() -> int:
 
         repo_root = Path(__file__).resolve().parents[1]
         batch_script = repo_root / "batch_video_ray.py"
-        gpu_ids = str(params.get("gpu_ids") or "0,1")
+        gpu_ids, gpu_mode = resolve_gpu_ids(params)
         cmd = [
             sys.executable,
             str(batch_script),
@@ -221,7 +247,10 @@ def main() -> int:
             cmd.extend(["--limit_items", str(limit_items)])
 
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(params.get("cuda_visible_devices") or gpu_ids)
+        requested_cuda_visible = str(params.get("cuda_visible_devices") or "auto").strip()
+        env["CUDA_VISIBLE_DEVICES"] = gpu_ids if requested_cuda_visible.lower() == "auto" else requested_cuda_visible
+        env["BOS_PIPELINE_ALLOCATED_GPUS"] = gpu_ids
+        env["BOS_PIPELINE_ALLOCATED_GPU_COUNT"] = str(len([item for item in gpu_ids.split(",") if item.strip()]))
         env["HF_HOME"] = str(params.get("hf_home") or env.get("HF_HOME") or "/data/cache/huggingface")
         env["PYTORCH_CUDA_ALLOC_CONF"] = str(
             params.get("pytorch_cuda_alloc_conf")
@@ -263,6 +292,8 @@ def main() -> int:
             "failure_count": failure_count,
             "model_path": str(params.get("model_path") or "/data/models/openbmb/MiniCPM-V-4_5"),
             "gpu_ids": gpu_ids,
+            "gpu_mode": gpu_mode,
+            "allocated_gpu_count": int(env["BOS_PIPELINE_ALLOCATED_GPU_COUNT"]),
             "max_num_frames": int(params.get("max_num_frames") or 38),
             "max_slice_nums": int(params.get("max_slice_nums") or 1),
         }
