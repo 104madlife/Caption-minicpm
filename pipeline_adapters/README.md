@@ -70,9 +70,11 @@ python batch_video_ray.py \
 
 ## GPU selection
 
-The current smoke test uses explicit GPU IDs. A future adapter version can add an
-`auto` mode that calls `nvidia-smi` before launching MiniCPM, chooses cards with
-enough free memory, then sets `CUDA_VISIBLE_DEVICES`.
+The adapter supports `gpu_ids=auto`. In that mode the main repository's GPU
+worker launcher probes `nvidia-smi`, chooses cards with enough free memory,
+acquires local GPU leases, and passes the allocation through
+`BOS_PIPELINE_ALLOCATED_GPUS`. The adapter then sets `CUDA_VISIBLE_DEVICES`
+before launching `batch_video_ray.py`.
 
 Be careful with GPU numbering: after setting `CUDA_VISIBLE_DEVICES=2,5`, many
 CUDA programs see those devices as local `0,1`. Keep the semantics consistent
@@ -85,8 +87,11 @@ the main Worker uploads them to BOS before marking the task done:
 
 ```text
 captions.jsonl
+failed_items.jsonl        # only when at least one item fails
+remaining_items.jsonl     # only when retryable items remain after a GPU/runtime failure
 _manifest.json
-_SUCCESS
+_SUCCESS                 # batch finished successfully, possibly with tolerated item failures
+_PARTIAL                 # retryable batch-level failure with diagnostic outputs
 batch_video_ray.log
 ```
 
@@ -105,3 +110,38 @@ batch_video_ray.log
 }
 ```
 
+Failed rows stay in the same `captions.jsonl` file with `status=failed`,
+`error`, `error_type`, and `retryable` fields. Ordinary item-level failures such
+as one bad video no longer force the whole framework task to fail by default.
+The adapter marks the task `done` when the subprocess finishes normally and the
+failure count is within the configured tolerance.
+
+Runtime parameters controlling that tolerance:
+
+```json
+{
+  "fail_on_item_failure": false,
+  "max_item_failure_count": null,
+  "max_item_failure_ratio": null,
+  "min_success_count": 1
+}
+```
+
+GPU/OOM/runtime failures are different. If `batch_video_ray.py` exits with a
+non-zero code, or if an item-level error text looks like CUDA OOM / Ray worker
+failure, the adapter writes partial diagnostics and marks the framework task
+`failed`:
+
+```text
+captions.jsonl
+failed_items.jsonl
+remaining_items.jsonl
+_manifest.json
+_PARTIAL
+batch_video_ray.log
+```
+
+`remaining_items.jsonl` is designed for the main repository's
+`scripts/recover_caption_batch.py` tool. It contains only items that are safe to
+retry, so recovery can create a smaller caption task instead of rerunning the
+entire original batch.

@@ -11,6 +11,27 @@ from pathlib import Path
 from typing import Any
 
 
+GPU_OOM_PATTERNS = (
+    "cuda out of memory",
+    "torch.outofmemoryerror",
+    "outofmemoryerror",
+    "cublas_status_alloc_failed",
+    "cudnn_status_alloc_failed",
+    "failed to allocate",
+    "out of memory",
+)
+GPU_RUNTIME_PATTERNS = (
+    "rayactorerror",
+    "actor died",
+    "worker died",
+    "node died",
+    "illegal memory access",
+    "device-side assert",
+    "cuda error",
+    "nccl",
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run MiniCPM caption from pipeline prepared items.")
     parser.add_argument("--input", required=True, help="Path to runtime_input.json.")
@@ -49,6 +70,63 @@ def write_runtime_output(
             "reason": reason,
         },
     )
+
+
+def parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def parse_optional_int(value: Any) -> int | None:
+    if value is None or str(value).strip() == "":
+        return None
+    return int(value)
+
+
+def parse_optional_float(value: Any) -> float | None:
+    if value is None or str(value).strip() == "":
+        return None
+    return float(value)
+
+
+def safe_item_stem(item_id: Any) -> str:
+    value = str(item_id or "")
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value).strip("._") or "item"
+
+
+def jsonl_line(data: dict[str, Any]) -> str:
+    return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(jsonl_line(row) for row in rows), encoding="utf-8")
+
+
+def classify_error_text(text: str, *, default: str = "algorithm_error") -> tuple[str, bool]:
+    lowered = text.lower()
+    if any(pattern in lowered for pattern in GPU_OOM_PATTERNS):
+        return "gpu_oom", True
+    if any(pattern in lowered for pattern in GPU_RUNTIME_PATTERNS):
+        return "gpu_runtime", True
+    if "no space left on device" in lowered:
+        return "local_disk_full", False
+    if "file not found" in lowered or "no such file" in lowered:
+        return "input_missing", False
+    return default, False
+
+
+def classify_subprocess_failure(returncode: int, stdout: str, stderr: str) -> tuple[str, bool]:
+    if returncode < 0:
+        return "process_signal", True
+    failure_type, retryable = classify_error_text(
+        "\n".join([stdout, stderr]),
+        default="subprocess_failed",
+    )
+    return failure_type, retryable
 
 
 def nested_get(data: dict[str, Any], dotted_path: str) -> Any:
@@ -154,23 +232,74 @@ def aggregate_outputs(
     selected_items: list[dict[str, Any]],
     batch_output_dir: Path,
     caption_jsonl_path: Path,
-) -> tuple[int, int, list[dict[str, Any]]]:
+    failed_items_path: Path,
+    remaining_items_path: Path,
+    subprocess_failed: bool,
+    subprocess_failure_type: str | None,
+    subprocess_retryable: bool,
+) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
+    failed_rows: list[dict[str, Any]] = []
+    remaining_rows: list[dict[str, Any]] = []
     success_count = 0
     failure_count = 0
+    missing_output_count = 0
+    retryable_failure_count = 0
 
     for item in selected_items:
         item_id = str(item.get("item_id") or "")
-        safe_item_id = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in item_id).strip("._") or "item"
+        safe_item_id = safe_item_stem(item_id)
         output_path = batch_output_dir / f"{safe_item_id}.json"
         if not output_path.is_file():
-            rows.append({**item, "status": "failed", "error": f"Missing batch output: {output_path}"})
+            error = f"Missing batch output: {output_path}"
+            retryable = bool((subprocess_failed and subprocess_retryable) or not subprocess_failed)
+            row = {
+                **item,
+                "status": "failed",
+                "error": error,
+                "error_type": subprocess_failure_type or "missing_output",
+                "retryable": retryable,
+            }
+            rows.append(row)
+            failed_rows.append(row)
+            if retryable:
+                remaining_rows.append(item)
+                retryable_failure_count += 1
             failure_count += 1
+            missing_output_count += 1
             continue
 
-        data = json.loads(output_path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            row = {
+                **item,
+                "status": "failed",
+                "error": f"Invalid batch output JSON: {type(exc).__name__}: {exc}",
+                "error_type": "output_json_invalid",
+                "retryable": True,
+            }
+            rows.append(row)
+            failed_rows.append(row)
+            remaining_rows.append(item)
+            failure_count += 1
+            retryable_failure_count += 1
+            continue
         if data.get("error"):
-            rows.append({**item, "status": "failed", "error": data["error"]})
+            error = str(data["error"])
+            error_type, retryable = classify_error_text(error)
+            row = {
+                **item,
+                "status": "failed",
+                "error": error,
+                "error_type": error_type,
+                "retryable": retryable,
+            }
+            rows.append(row)
+            failed_rows.append(row)
+            if retryable:
+                remaining_rows.append(item)
+                retryable_failure_count += 1
             failure_count += 1
             continue
 
@@ -186,11 +315,61 @@ def aggregate_outputs(
         success_count += 1
 
     caption_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-    caption_jsonl_path.write_text(
-        "".join(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for row in rows),
-        encoding="utf-8",
-    )
-    return success_count, failure_count, rows
+    write_jsonl(caption_jsonl_path, rows)
+    write_jsonl(failed_items_path, failed_rows)
+    write_jsonl(remaining_items_path, remaining_rows)
+    return {
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "missing_output_count": missing_output_count,
+        "retryable_failure_count": retryable_failure_count,
+        "rows": rows,
+        "failed_rows": failed_rows,
+        "remaining_rows": remaining_rows,
+    }
+
+
+def should_fail_framework_task(
+    *,
+    params: dict[str, Any],
+    total_item_count: int,
+    success_count: int,
+    failure_count: int,
+    retryable_failure_count: int,
+    subprocess_returncode: int,
+) -> tuple[bool, str | None]:
+    if subprocess_returncode != 0:
+        return True, f"MiniCPM subprocess exited with code {subprocess_returncode}."
+    if retryable_failure_count:
+        return True, f"MiniCPM produced {retryable_failure_count} retryable item failure(s)."
+
+    min_success_count = int(params.get("min_success_count") or 1)
+    if success_count < min_success_count:
+        return True, f"MiniCPM success_count={success_count} is below min_success_count={min_success_count}."
+
+    if failure_count <= 0:
+        return False, None
+
+    if parse_bool(params.get("fail_on_item_failure"), default=False):
+        return True, f"MiniCPM caption failed for {failure_count} item(s)."
+
+    max_failure_count = parse_optional_int(params.get("max_item_failure_count"))
+    if max_failure_count is not None and failure_count > max_failure_count:
+        return True, (
+            f"MiniCPM item failure_count={failure_count} exceeds "
+            f"max_item_failure_count={max_failure_count}."
+        )
+
+    max_failure_ratio = parse_optional_float(params.get("max_item_failure_ratio"))
+    if max_failure_ratio is not None and total_item_count > 0:
+        failure_ratio = failure_count / total_item_count
+        if failure_ratio > max_failure_ratio:
+            return True, (
+                f"MiniCPM item failure_ratio={failure_ratio:.6f} exceeds "
+                f"max_item_failure_ratio={max_failure_ratio:.6f}."
+            )
+
+    return False, None
 
 
 def main() -> int:
@@ -211,8 +390,11 @@ def main() -> int:
     batch_output_dir = output_dir / "batch_outputs"
     input_list_path = output_dir / "caption_input_items.jsonl"
     caption_jsonl_path = output_dir / "captions.jsonl"
+    failed_items_path = output_dir / "failed_items.jsonl"
+    remaining_items_path = output_dir / "remaining_items.jsonl"
     manifest_path = output_dir / "_manifest.json"
     success_path = output_dir / "_SUCCESS"
+    partial_path = output_dir / "_PARTIAL"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -272,15 +454,60 @@ def main() -> int:
             "COMMAND: " + " ".join(cmd) + "\n\nSTDOUT:\n" + completed.stdout + "\n\nSTDERR:\n" + completed.stderr,
             encoding="utf-8",
         )
-        if completed.returncode != 0:
-            raise RuntimeError(f"batch_video_ray.py failed with exit code {completed.returncode}; log={log_path}")
+        subprocess_failed = completed.returncode != 0
+        subprocess_failure_type: str | None = None
+        subprocess_retryable = False
+        if subprocess_failed:
+            subprocess_failure_type, subprocess_retryable = classify_subprocess_failure(
+                completed.returncode,
+                completed.stdout,
+                completed.stderr,
+            )
 
-        success_count, failure_count, rows = aggregate_outputs(
+        aggregate = aggregate_outputs(
             selected_items=selected_items,
             batch_output_dir=batch_output_dir,
             caption_jsonl_path=caption_jsonl_path,
+            failed_items_path=failed_items_path,
+            remaining_items_path=remaining_items_path,
+            subprocess_failed=subprocess_failed,
+            subprocess_failure_type=subprocess_failure_type,
+            subprocess_retryable=subprocess_retryable,
+        )
+        success_count = int(aggregate["success_count"])
+        failure_count = int(aggregate["failure_count"])
+        missing_output_count = int(aggregate["missing_output_count"])
+        retryable_failure_count = int(aggregate["retryable_failure_count"])
+        rows = list(aggregate["rows"])
+        failed_rows = list(aggregate["failed_rows"])
+        remaining_rows = list(aggregate["remaining_rows"])
+
+        should_fail, failure_reason = should_fail_framework_task(
+            params=params,
+            total_item_count=len(selected_items),
+            success_count=success_count,
+            failure_count=failure_count,
+            retryable_failure_count=retryable_failure_count,
+            subprocess_returncode=completed.returncode,
         )
         run_id = index_run_id(runtime_input)
+        if should_fail:
+            if subprocess_failure_type:
+                failure_type = subprocess_failure_type
+            elif retryable_failure_count:
+                failure_type = "retryable_item_failure"
+            elif success_count <= 0:
+                failure_type = "no_successful_items"
+            else:
+                failure_type = "item_failure_threshold_exceeded"
+            batch_status = "failed_retryable" if subprocess_retryable or retryable_failure_count else "failed"
+        elif failure_count:
+            failure_type = "item_failures"
+            batch_status = "completed_with_item_failures"
+        else:
+            failure_type = None
+            batch_status = "completed"
+
         manifest = {
             "schema_version": "caption_manifest.v1",
             "task_id": runtime_input.get("task_id"),
@@ -290,6 +517,14 @@ def main() -> int:
             "total_item_count": len(selected_items),
             "success_count": success_count,
             "failure_count": failure_count,
+            "missing_output_count": missing_output_count,
+            "retryable_failure_count": retryable_failure_count,
+            "remaining_item_count": len(remaining_rows),
+            "subprocess_returncode": completed.returncode,
+            "subprocess_failure_type": subprocess_failure_type,
+            "subprocess_retryable": subprocess_retryable,
+            "batch_status": batch_status,
+            "failure_type": failure_type,
             "model_path": str(params.get("model_path") or "/data/models/openbmb/MiniCPM-V-4_5"),
             "gpu_ids": gpu_ids,
             "gpu_mode": gpu_mode,
@@ -298,7 +533,10 @@ def main() -> int:
             "max_slice_nums": int(params.get("max_slice_nums") or 1),
         }
         write_json(manifest_path, manifest)
-        success_path.write_text("", encoding="utf-8")
+        if should_fail:
+            partial_path.write_text("", encoding="utf-8")
+        else:
+            success_path.write_text("", encoding="utf-8")
 
         raw_output_prefix = str(params.get("output_prefix") or "test/output/minicpm_caption_v1/smoke/")
         if run_id:
@@ -307,29 +545,55 @@ def main() -> int:
         output_files = [
             {"local_path": str(caption_jsonl_path), "output_key": f"{output_prefix}captions.jsonl"},
             {"local_path": str(manifest_path), "output_key": f"{output_prefix}_manifest.json"},
-            {"local_path": str(success_path), "output_key": f"{output_prefix}_SUCCESS"},
             {"local_path": str(log_path), "output_key": f"{output_prefix}batch_video_ray.log"},
         ]
+        if failed_rows:
+            output_files.append({"local_path": str(failed_items_path), "output_key": f"{output_prefix}failed_items.jsonl"})
+        if remaining_rows:
+            output_files.append(
+                {"local_path": str(remaining_items_path), "output_key": f"{output_prefix}remaining_items.jsonl"}
+            )
+        if should_fail:
+            output_files.append({"local_path": str(partial_path), "output_key": f"{output_prefix}_PARTIAL"})
+        else:
+            output_files.append({"local_path": str(success_path), "output_key": f"{output_prefix}_SUCCESS"})
+
         artifacts = {
             "caption_jsonl_key": f"{output_prefix}captions.jsonl",
             "manifest_key": f"{output_prefix}_manifest.json",
-            "success_key": f"{output_prefix}_SUCCESS",
             "log_key": f"{output_prefix}batch_video_ray.log",
             "total_item_count": len(selected_items),
             "success_count": success_count,
             "failure_count": failure_count,
+            "missing_output_count": missing_output_count,
+            "retryable_failure_count": retryable_failure_count,
+            "remaining_item_count": len(remaining_rows),
+            "batch_status": batch_status,
+            "failure_type": failure_type,
+            "retryable": bool(subprocess_retryable or retryable_failure_count),
+            "subprocess_returncode": completed.returncode,
+            "subprocess_failure_type": subprocess_failure_type,
+            "gpu_ids": gpu_ids,
+            "gpu_mode": gpu_mode,
+            "allocated_gpu_count": int(env["BOS_PIPELINE_ALLOCATED_GPU_COUNT"]),
             "sample_item_ids": [str(row.get("item_id")) for row in rows[:5]],
         }
-        if failure_count:
+        if failed_rows:
+            artifacts["failed_items_key"] = f"{output_prefix}failed_items.jsonl"
+        if remaining_rows:
+            artifacts["remaining_items_key"] = f"{output_prefix}remaining_items.jsonl"
+        if should_fail:
+            artifacts["partial_key"] = f"{output_prefix}_PARTIAL"
             write_runtime_output(
                 runtime_output_path,
                 status="failed",
                 artifacts=artifacts,
                 output_files=output_files,
-                reason=f"MiniCPM caption failed for {failure_count} item(s).",
+                reason=failure_reason or "MiniCPM caption batch failed.",
             )
             return 0
 
+        artifacts["success_key"] = f"{output_prefix}_SUCCESS"
         write_runtime_output(
             runtime_output_path,
             status="done",
