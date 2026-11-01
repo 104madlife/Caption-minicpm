@@ -168,9 +168,19 @@ def main():
         return
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_ids
-    ray.init(ignore_reinit_error=True, include_dashboard=False, runtime_env={"env_vars": {
-        "CUDA_VISIBLE_DEVICES": args.gpu_ids
-    }})
+    # Keep Ray's Unix socket paths short enough for AF_UNIX (the pipeline run
+    # directory can be deeply nested).  RAY_TMPDIR is supplied by the
+    # pipeline adapter and is intentionally local-only runtime state.
+    ray_kwargs = {
+        "ignore_reinit_error": True,
+        "include_dashboard": False,
+        "runtime_env": {"env_vars": {"CUDA_VISIBLE_DEVICES": args.gpu_ids}},
+    }
+    ray_tmp = os.environ.get("RAY_TMPDIR")
+    if ray_tmp:
+        os.makedirs(ray_tmp, exist_ok=True)
+        ray_kwargs["_temp_dir"] = ray_tmp
+    ray.init(**ray_kwargs)
 
     gpu_ids = [int(x) for x in args.gpu_ids.split(",")] if args.gpu_ids else [0]
     workers = [GPUWorker.remote(args.model_path, args.dtype, args.attn_impl, args.max_slice_nums, args.max_num_frames, question) for _ in gpu_ids]

@@ -445,6 +445,8 @@ def main() -> int:
             cwd=str(repo_root),
             env=env,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             check=False,
         )
